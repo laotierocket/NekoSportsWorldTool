@@ -10,6 +10,7 @@ use super::submit::{submit_record, SubmitParams, SubmitResult};
 use crate::track::generate_road::RouteMode;
 use crate::track::generator::build as gen_track;
 use crate::track::wire::{build_obs_object, five_point_wrapper, obs_keys};
+use rand_distr::{Distribution, Normal};
 use serde_json::Value;
 use rand_distr::{Distribution, Normal};
 
