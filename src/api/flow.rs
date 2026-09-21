@@ -10,9 +10,7 @@ use super::submit::{submit_record, SubmitParams, SubmitResult};
 use crate::track::generate_road::RouteMode;
 use crate::track::generator::build as gen_track;
 use crate::track::wire::{build_obs_object, five_point_wrapper, obs_keys};
-use rand_distr::{Distribution, Normal};
 use serde_json::Value;
-use rand_distr::{Distribution, Normal};
 
 #[derive(Clone, Copy)]
 pub struct RunParams {
@@ -54,9 +52,52 @@ pub fn run_full_flow(
     ));
     sleep_secs(2);
 
-    // ② 实时点位（拒绝本地样本兜底）
+    // ② 电子围栏 + 路网（一次性加载，供随机锚点与 Road 轨迹复用）
+    log("[fence] 拉取电子围栏…");
+    let fences = match crate::api::fence::fetch_geo_fence(client) {
+        Ok(f) => {
+            let _ = crate::api::model::save_fence_cache(&f);
+            f
+        }
+        Err(e) => {
+            log(&format!("⚠ [fence] 围栏获取失败，回退缓存: {e}"));
+            crate::api::model::load_fence_cache().unwrap_or_default()
+        }
+    };
+    log(&format!("√ [fence] {} 个围栏", fences.len()));
+
+    let config = crate::api::model::load_config();
+    let net_opt: Option<route_planner::RoadGraph> = if config.osm_path.is_empty() {
+        None
+    } else {
+        match crate::track::generate_road::load_network_path(&config.osm_path) {
+            Ok(mut net) => {
+                crate::track::generate_road::align_network(&mut net);
+                Some(crate::track::generate_road::apply_fences(&net, &fences))
+            }
+            Err(e) => {
+                log(&format!("⚠ [track] 路网加载失败: {e}"));
+                None
+            }
+        }
+    };
+    let buildings: Vec<Vec<(f64, f64)>> = net_opt
+        .as_ref()
+        .map(|n| {
+            n.buildings
+                .iter()
+                .map(|r| r.iter().map(|c| (c.lat, c.lon)).collect())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // ③ 随机锚点：围栏内建筑物附近，每次随机（不持久化，避免打卡点集中获取）
+    let anchor = crate::track::generate_road::random_anchor_in_fence(&fences, &buildings)
+        .unwrap_or((client.identity.anchor_lat, client.identity.anchor_lon));
+    log(&format!("√ [points] 随机锚点 BD=({:.6},{:.6})", anchor.0, anchor.1));
+
+    // ④ 实时点位（拒绝本地样本兜底）
     log("[points] 拉取实时点位…");
-    let anchor = (client.identity.anchor_lat, client.identity.anchor_lon);
     let pts = points::fetch_points(client, anchor, log)?;
     if pts.is_empty() {
         return Err("实时点位为空 —— 拒绝本地样本兜底".into());
@@ -73,7 +114,7 @@ pub fn run_full_flow(
         ));
     }
 
-    // ③ 轨迹生成（必经点 + 打卡点）
+    // ⑤ 轨迹生成（必经点 + 打卡点）
     let pts_bd = points::points_bd(&pts);
     // 必经点保持策略顺序置于前端（waypoints[0] 即起点），剩余打卡点去重后按质心角
     // 排序，使环序自然且不破坏必经点顺序。
@@ -98,20 +139,6 @@ pub fn run_full_flow(
     }
     if let Some(&(slat, slon)) = route_pts.first() {
         log(&format!("√ [track] 起点 BD=({slat:.6},{slon:.6})"));
-    }
-    // 用打卡点随机偏移更新锚点并持久化：下次拉点位即学校真实坐标，摆脱写死的默认值
-    if !pts_bd.is_empty() {
-        let idx = (rand::random::<f64>() * pts_bd.len() as f64) as usize;
-        let (clat, clng) = pts_bd[idx];
-        let mut rng = rand::thread_rng();
-        let normal = Normal::<f64>::new(0.0, 120.0).unwrap();
-        let dlat = normal.sample(&mut rng).clamp(-200.0, 200.0) / crate::track::geom::MET_PER_DEG_LAT;
-        let dlng = normal.sample(&mut rng).clamp(-200.0, 200.0) / crate::track::geom::MET_PER_DEG_LNG;
-        client.identity.anchor_lat = clat + dlat;
-        client.identity.anchor_lon = clng + dlng;
-        if let Err(e) = super::model::save_identity(&client.identity) {
-            log(&format!("⚠ 锚点持久化失败: {e}"));
-        }
     }
     // 平均配速须落在有效窗口内（否则逐点速度无法全窗内），越界时修正时长
     let mut params = *params;
@@ -139,62 +166,40 @@ pub fn run_full_flow(
     // 随机 0-4 秒偏移（终端上报的 flag 与首点差 <5s），轨迹/提交/OBS/五点统一使用
     let start_ms = params.start_ms + (rand::random::<i64>() % 5) * 1000;
     let track = match params.route_mode {
-        RouteMode::Road => {
-            let cfg = crate::api::model::load_config();
-            if cfg.osm_path.is_empty() {
-                log("⚠ [track] 未配置 OSM 路网，回退经典算法");
-                gen_track(params.dist, params.dur, params.seed, (0.0, 0.0), start_ms, &pts_bd)
-            } else {
-                match crate::track::generate_road::load_network_path(&cfg.osm_path) {
-                    Ok(mut net) => {
-                        crate::track::generate_road::align_network(&mut net);
-                        // 电子围栏：裁剪到围栏内道路（失败/无围栏则跳过）
-                        let fences = match crate::api::fence::fetch_geo_fence(client) {
-                            Ok(f) => {
-                                let _ = crate::api::model::save_fence_cache(&f);
-                                log(&format!("√ [track] 电子围栏 {} 个", f.len()));
-                                f
-                            }
-                            Err(e) => {
-                                log(&format!("⚠ [track] 围栏获取失败，回退缓存: {e}"));
-                                crate::api::model::load_fence_cache().unwrap_or_default()
-                            }
-                        };
-                        let filtered = crate::track::generate_road::apply_fences(&net, &fences);
-                        // 强制必经点（不含起点）：其余打卡点仅软引导 + <40m 吸附
-                        let must_bd: Vec<(f64, f64)> =
-                            pol.must_points.iter().skip(1).copied().collect();
-                        match crate::track::generate_road::build_road(
-                            params.dist,
-                            params.dur,
-                            params.seed,
-                            start_ms,
-                            &route_pts,
-                            &must_bd,
-                            &filtered,
-                        ) {
-                            Ok(t) => {
-                                log(&format!(
-                                    "√ [track] 真实道路路由 {} 点 / {} 建筑 / {} 围栏",
-                                    t.locations.len(),
-                                    filtered.buildings.len(),
-                                    fences.len()
-                                ));
-                                t
-                            }
-                            Err(e) => {
-                                log(&format!("⚠ [track] 道路路由失败，回退经典算法: {e}"));
-                                gen_track(params.dist, params.dur, params.seed, (0.0, 0.0), start_ms, &pts_bd)
-                            }
-                        }
+        RouteMode::Road => match net_opt {
+            Some(filtered) => {
+                // 强制必经点（不含起点）：其余打卡点仅软引导 + <40m 吸附
+                let must_bd: Vec<(f64, f64)> =
+                    pol.must_points.iter().skip(1).copied().collect();
+                match crate::track::generate_road::build_road(
+                    params.dist,
+                    params.dur,
+                    params.seed,
+                    start_ms,
+                    &route_pts,
+                    &must_bd,
+                    &filtered,
+                ) {
+                    Ok(t) => {
+                        log(&format!(
+                            "√ [track] 真实道路路由 {} 点 / {} 建筑 / {} 围栏",
+                            t.locations.len(),
+                            filtered.buildings.len(),
+                            fences.len()
+                        ));
+                        t
                     }
                     Err(e) => {
-                        log(&format!("⚠ [track] 路网加载失败，回退经典算法: {e}"));
+                        log(&format!("⚠ [track] 道路路由失败，回退经典算法: {e}"));
                         gen_track(params.dist, params.dur, params.seed, (0.0, 0.0), start_ms, &pts_bd)
                     }
                 }
             }
-        }
+            None => {
+                log("⚠ [track] 未配置 OSM 路网，回退经典算法");
+                gen_track(params.dist, params.dur, params.seed, (0.0, 0.0), start_ms, &pts_bd)
+            }
+        },
         RouteMode::Legacy => gen_track(params.dist, params.dur, params.seed, (0.0, 0.0), start_ms, &pts_bd),
     };
     log(&format!(

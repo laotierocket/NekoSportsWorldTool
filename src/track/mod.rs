@@ -259,6 +259,40 @@ mod tests {
         }
     }
 
+    /// 围栏内随机锚点：优先建筑附近、退化为围栏内，且均不越出围栏。
+    #[test]
+    fn test_random_anchor_in_fence() {
+        use super::generate_road::random_anchor_in_fence;
+        use route_planner::{point_in_polygon, Coord};
+        let fence: Vec<(f64, f64)> = vec![
+            (38.899, 121.539),
+            (38.899, 121.543),
+            (38.903, 121.543),
+            (38.903, 121.539),
+        ];
+        let polys: Vec<Coord> = fence.iter().map(|p| Coord::new(p.1, p.0)).collect();
+        // 无建筑：退化为围栏内随机点
+        for _ in 0..20 {
+            let (lat, lon) = random_anchor_in_fence(&[fence.clone()], &[]).unwrap();
+            assert!(point_in_polygon(&polys, Coord::new(lon, lat)), "({lat},{lon}) 越出围栏");
+        }
+        // 有建筑：落在建筑质心附近（≤60m）
+        let building: Vec<(f64, f64)> = vec![
+            (38.9010, 121.5400),
+            (38.9010, 121.5410),
+            (38.9015, 121.5410),
+            (38.9015, 121.5400),
+        ];
+        for _ in 0..20 {
+            let (lat, lon) =
+                random_anchor_in_fence(&[fence.clone()], &[building.clone()]).unwrap();
+            let dist = (((lat - 38.90125) * MET_PER_DEG_LAT).powi(2)
+                + ((lon - 121.5405) * MET_PER_DEG_LNG).powi(2))
+            .sqrt();
+            assert!(dist < 60.0, "距建筑过远: {dist}m");
+        }
+    }
+
     /// OBS 对象：10 键、gzip+base64 可解、run_data 27 键点集。
     #[test]
     fn test_obs_object_structure() {

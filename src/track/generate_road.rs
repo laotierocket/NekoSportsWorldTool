@@ -174,6 +174,82 @@ pub fn radial_order(points_bd: &[(f64, f64)]) -> Vec<(f64, f64)> {
     ordered
 }
 
+/// 围栏内随机锚点（BD 系，返回 (lat, lng)）。
+///
+/// 优先随机挑一个「质心落在围栏内」的建筑，在其质心周围 0-40m 随机取点；
+/// 无建筑时退化为围栏多边形内随机点（包围盒拒绝采样）。每次调用重新随机，
+/// 用于拉取打卡点的请求锚点，避免锚点长期固定/校准导致的打卡点集中获取。
+pub fn random_anchor_in_fence(
+    fences: &[Vec<(f64, f64)>],
+    buildings: &[Vec<(f64, f64)>],
+) -> Option<(f64, f64)> {
+    let polys: Vec<Vec<Coord>> = fences
+        .iter()
+        .map(|r| r.iter().map(|p| Coord::new(p.1, p.0)).collect())
+        .collect();
+
+    // 只保留质心落在任一围栏内的建筑
+    let inside: Vec<(f64, f64)> = buildings
+        .iter()
+        .filter_map(|ring| {
+            let n = ring.len();
+            if n == 0 {
+                return None;
+            }
+            let (clat, clng) = (
+                ring.iter().map(|q| q.0).sum::<f64>() / n as f64,
+                ring.iter().map(|q| q.1).sum::<f64>() / n as f64,
+            );
+            polys
+                .iter()
+                .any(|poly| point_in_polygon(poly, Coord::new(clng, clat)))
+                .then_some((clat, clng))
+        })
+        .collect();
+
+    if !inside.is_empty() {
+        let idx = (rand::random::<f64>() * inside.len() as f64) as usize;
+        let (clat, clng) = inside[idx];
+        let ang = rand::random::<f64>() * std::f64::consts::TAU;
+        let dist_m = rand::random::<f64>() * 40.0;
+        return Some((
+            clat + dist_m * ang.sin() / MET_PER_DEG_LAT,
+            clng + dist_m * ang.cos() / MET_PER_DEG_LNG,
+        ));
+    }
+
+    // 无建筑：围栏多边形内随机点
+    if fences.is_empty() {
+        return None;
+    }
+    let poly = &fences[(rand::random::<f64>() * fences.len() as f64) as usize % fences.len()];
+    if poly.len() < 3 {
+        return None;
+    }
+    let coord: Vec<Coord> = poly.iter().map(|p| Coord::new(p.1, p.0)).collect();
+    let (mut min_lat, mut max_lat) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut min_lng, mut max_lng) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &(lat, lng) in poly {
+        min_lat = min_lat.min(lat);
+        max_lat = max_lat.max(lat);
+        min_lng = min_lng.min(lng);
+        max_lng = max_lng.max(lng);
+    }
+    for _ in 0..256 {
+        let lat = min_lat + rand::random::<f64>() * (max_lat - min_lat);
+        let lng = min_lng + rand::random::<f64>() * (max_lng - min_lng);
+        if point_in_polygon(&coord, Coord::new(lng, lat)) {
+            return Some((lat, lng));
+        }
+    }
+    // 兜底：围栏质心
+    let n = poly.len() as f64;
+    Some((
+        poly.iter().map(|q| q.0).sum::<f64>() / n,
+        poly.iter().map(|q| q.1).sum::<f64>() / n,
+    ))
+}
+
 /// 路线 → 平面折线 + 弧长表。
 ///
 /// `arcs[k]` 必须与 `dense[k]` 一一对应（`ring_point_at` 按同下标取弧长），
