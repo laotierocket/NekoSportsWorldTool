@@ -114,11 +114,12 @@ pub fn run_full_flow(
         ));
     }
 
-    // ⑤ 轨迹生成（必经点 + 打卡点）
+    // ⑤ 轨迹生成（起点=随机锚点 + 必经点 + 打卡点）
     let pts_bd = points::points_bd(&pts);
-    // 必经点保持策略顺序置于前端（waypoints[0] 即起点），剩余打卡点去重后按质心角
-    // 排序，使环序自然且不破坏必经点顺序。
-    let mut route_pts: Vec<(f64, f64)> = pol.must_points.clone();
+    // 起点为围栏内建筑附近随机锚点（每次随机，不再固定于某打卡点）；必经点保持策略
+    // 顺序，剩余打卡点去重后按质心角排序，使环序自然且不破坏必经点顺序。
+    let mut route_pts: Vec<(f64, f64)> = vec![anchor];
+    route_pts.extend(pol.must_points.iter().copied());
     let mut free: Vec<(f64, f64)> = Vec::new();
     for p in &pts_bd {
         if !route_pts.iter().any(|q| (q.0 - p.0).abs() < 1e-6 && (q.1 - p.1).abs() < 1e-6) {
@@ -137,9 +138,7 @@ pub fn run_full_flow(
     } else {
         log(&format!("[policy] 响应未含必经点列表，仅用打卡点 {} 个", route_pts.len()));
     }
-    if let Some(&(slat, slon)) = route_pts.first() {
-        log(&format!("√ [track] 起点 BD=({slat:.6},{slon:.6})"));
-    }
+    log(&format!("√ [track] 起点（随机锚点）BD=({:.6},{:.6})", anchor.0, anchor.1));
     // 平均配速须落在有效窗口内（否则逐点速度无法全窗内），越界时修正时长
     let mut params = *params;
     let avg = params.dist / params.dur as f64;
@@ -168,9 +167,9 @@ pub fn run_full_flow(
     let track = match params.route_mode {
         RouteMode::Road => match net_opt {
             Some(filtered) => {
-                // 强制必经点（不含起点）：其余打卡点仅软引导 + <40m 吸附
+                // 强制必经点（起点为随机锚点，必经点全部强制经过）：其余打卡点软引导 + <40m 吸附
                 let must_bd: Vec<(f64, f64)> =
-                    pol.must_points.iter().skip(1).copied().collect();
+                    pol.must_points.iter().copied().collect();
                 match crate::track::generate_road::build_road(
                     params.dist,
                     params.dur,

@@ -105,7 +105,16 @@ pub fn plan_road_view(
     align_network(&mut g);
     g = apply_fences(&g, fences);
     let ordered = radial_order(points_bd);
-    let waypoints: Vec<Coord> = ordered.iter().map(|p| Coord::new(p.1, p.0)).collect();
+    // 起点：围栏内建筑附近随机锚点（每次预览/提交重新随机，与提交侧一致）
+    let buildings_bd: Vec<Vec<(f64, f64)>> = g
+        .buildings
+        .iter()
+        .map(|r| r.iter().map(|c| (c.lat, c.lon)).collect())
+        .collect();
+    let start = random_anchor_in_fence(fences, &buildings_bd)
+        .unwrap_or_else(|| ordered.first().copied().unwrap_or((0.0, 0.0)));
+    let mut waypoints: Vec<Coord> = vec![Coord::new(start.1, start.0)];
+    waypoints.extend(ordered.iter().map(|p| Coord::new(p.1, p.0)));
     let opts = RouteOptions::default();
     let route = plan_route_split(&g, &waypoints, &[], dist, seed, &opts)?;
     let route_pts: Vec<(f64, f64)> = route.points.iter().map(|p| (p.lat, p.lon)).collect();
