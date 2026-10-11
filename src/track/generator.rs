@@ -350,7 +350,7 @@ pub fn build(
     }
     let _ = seg_n;
 
-    apply_post_fixes(&mut locs, &mut rng, start_ms);
+    apply_post_fixes(&mut locs, &mut rng, start_ms, true);
 
     // 点位吸附：<40m 精确落位
     for pl in points_bd {

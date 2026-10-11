@@ -80,10 +80,17 @@ pub struct Config {
     /// 路线算法：legacy | road。
     #[serde(default = "default_route_mode")]
     pub route_mode: String,
+    /// 真实道路模式配速不合格路段占比（0-1，仅 road 模式）。
+    #[serde(default = "default_invalid_ratio")]
+    pub invalid_ratio: f64,
 }
 
 fn default_route_mode() -> String {
     "legacy".into()
+}
+
+fn default_invalid_ratio() -> f64 {
+    0.08
 }
 
 fn default_f32() -> f32 {
@@ -123,6 +130,7 @@ impl Default for Config {
             update_check: default_update_check(),
             osm_path: String::new(),
             route_mode: default_route_mode(),
+            invalid_ratio: default_invalid_ratio(),
         }
     }
 }
